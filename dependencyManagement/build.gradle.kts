@@ -47,7 +47,7 @@ val CORE_DEPENDENCIES = listOf(
   "com.google.auto.value:auto-value-annotations:1.9",
   "com.google.errorprone:error_prone_annotations:2.14.0",
   "com.google.errorprone:error_prone_core:2.14.0",
-  "com.google.errorprone:error_prone_test_helpers:2.14.0",
+  "com.google.errorprone:error_prone_test_helpers:2.15.0",
   // When updating, also update conventions/build.gradle.kts
   "net.bytebuddy:byte-buddy:1.12.17",
   "net.bytebuddy:byte-buddy-dep:1.12.17",
