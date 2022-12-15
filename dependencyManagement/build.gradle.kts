@@ -41,7 +41,7 @@ val autoValueVersion = "1.10.1"
 val errorProneVersion = "2.16"
 val byteBuddyVersion = "1.12.19"
 val jmhVersion = "1.36"
-val mockitoVersion = "4.9.0"
+val mockitoVersion = "4.10.0"
 val slf4jVersion = "2.0.5"
 
 val CORE_DEPENDENCIES = listOf(
