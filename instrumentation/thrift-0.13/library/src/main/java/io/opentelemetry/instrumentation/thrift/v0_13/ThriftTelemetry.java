@@ -89,12 +89,11 @@ public final class ThriftTelemetry {
                 if (args.length > 0 && args[args.length - 1] instanceof AsyncMethodCallback) {
                   AsyncMethodCallback<?> callback = (AsyncMethodCallback<?>) args[args.length - 1];
                   args[args.length - 1] = AsyncMethodCallbackUtil.wrap(callback, clientContext);
-                  clientContext.setHasAsyncCallback();
                 }
                 return method.invoke(client, args);
               } catch (InvocationTargetException e) {
                 error = e.getCause();
-                throw e.getCause();
+                throw error;
               } catch (Throwable t) {
                 error = t;
                 throw t;
