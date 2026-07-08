@@ -25,7 +25,6 @@ import static io.opentelemetry.semconv.incubating.RpcIncubatingAttributes.RPC_ME
 import static io.opentelemetry.semconv.incubating.RpcIncubatingAttributes.RPC_SERVICE;
 import static io.opentelemetry.semconv.incubating.RpcIncubatingAttributes.RPC_SYSTEM;
 import static java.util.Arrays.asList;
-import static java.util.Collections.singletonList;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -35,6 +34,7 @@ import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.instrumentation.testing.junit.AgentInstrumentationExtension;
 import io.opentelemetry.instrumentation.testing.junit.InstrumentationExtension;
 import io.opentelemetry.sdk.trace.data.SpanData;
+import jakarta.annotation.PreDestroy;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -43,20 +43,18 @@ import org.apache.pekko.http.scaladsl.Http;
 import org.assertj.core.api.AbstractStringAssert;
 import org.elasticmq.rest.sqs.SQSRestServer;
 import org.elasticmq.rest.sqs.SQSRestServerBuilder;
-import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.context.ApplicationContext;
+import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.messaging.support.MessageBuilder;
 
 @SuppressWarnings("deprecation") // using deprecated semconv
 @SpringBootTest(
     webEnvironment = SpringBootTest.WebEnvironment.NONE,
-    classes = AwsSqsTestApplication.class)
+    classes = {AwsSqsTestApplication.class, AwsSqsTest.TestContextConfiguration.class})
 class AwsSqsTest {
   @RegisterExtension
   static final InstrumentationExtension testing = AgentInstrumentationExtension.create();
@@ -65,61 +63,27 @@ class AwsSqsTest {
 
   @Autowired SqsTemplate sqsTemplate;
   @Autowired MessageListenerContainerRegistry registry;
-  @Autowired ApplicationContext applicationContext;
 
-  // Warmup is performed only once for the entire test class to avoid each test waiting for
-  // the Spring SQS listener containers (which start asynchronously) to resolve queue URLs
-  // and process an initial message before telemetry data can be reliably cleared.
-  private static volatile boolean initialized = false;
+  @TestConfiguration
+  static class TestContextConfiguration {
+
+    @PreDestroy
+    public void cleanup() {
+      // Stopping the SQS server as part of spring cleanup instead of junit @AfterAll because
+      // junit @AfterAll is executed before spring context cleanup, which causes the SQS server to
+      // be stopped before the spring SQS listener containers are stopped, resulting in errors in
+      // the logs.
+      if (sqs != null) {
+        sqs.stopAndWait();
+      }
+    }
+  }
 
   @BeforeAll
   static void setUp() {
     sqs = SQSRestServerBuilder.withPort(0).withInterface("localhost").start();
     Http.ServerBinding server = sqs.waitUntilStarted();
     AwsSqsTestApplication.sqsPort = server.localAddress().getPort();
-  }
-
-  @BeforeEach
-  void clearAndWarmup() throws InterruptedException {
-    if (!initialized) {
-      initialized = true;
-      // Send a warmup message to each queue so the listener containers fully initialize
-      // (resolve queue URLs, start polling) and process at least one message. We wait for
-      // both process spans and the async Sqs.DeleteMessageBatch to complete before clearing
-      // data — otherwise those spans leak into subsequent test assertions.
-      sqsTemplate.send("test-queue", "warmup");
-      sqsTemplate.sendMany(
-          "test-batch-queue", singletonList(MessageBuilder.withPayload("warmup1").build()));
-
-      long startTime = System.currentTimeMillis();
-      while (System.currentTimeMillis() - startTime < 30000) {
-        long count =
-            testing.spans().stream().filter(s -> s.getName().equals("test-queue process")).count();
-        long countBatch =
-            testing.spans().stream()
-                .filter(s -> s.getName().equals("test-batch-queue process"))
-                .count();
-        long countDelete =
-            testing.spans().stream()
-                .filter(s -> s.getName().equals("Sqs.DeleteMessageBatch"))
-                .count();
-        if (count >= 1 && countBatch >= 1 && countDelete >= 2) {
-          break;
-        }
-        Thread.sleep(100);
-      }
-    }
-
-    testing.clearData();
-    AwsSqsTestApplication.messageHandler = null;
-    AwsSqsTestApplication.batchMessageHandler = null;
-  }
-
-  @AfterAll
-  static void cleanUp() {
-    if (sqs != null) {
-      sqs.stopAndWait();
-    }
   }
 
   @Test
@@ -138,6 +102,24 @@ class AwsSqsTest {
         trace ->
             trace.hasSpansSatisfyingExactly(
                 span -> span.hasName("parent").hasKind(SpanKind.INTERNAL).hasNoParent(),
+                span ->
+                    span.hasName("Sqs.GetQueueUrl")
+                        .hasKind(SpanKind.CLIENT)
+                        .hasParent(trace.getSpan(0))
+                        .hasAttributesSatisfyingExactly(
+                            equalTo(RPC_SYSTEM, "aws-api"),
+                            equalTo(RPC_METHOD, "GetQueueUrl"),
+                            equalTo(RPC_SERVICE, "Sqs"),
+                            equalTo(HTTP_REQUEST_METHOD, POST),
+                            equalTo(HTTP_RESPONSE_STATUS_CODE, 200),
+                            equalTo(SERVER_ADDRESS, "localhost"),
+                            equalTo(SERVER_PORT, AwsSqsTestApplication.sqsPort),
+                            satisfies(
+                                URL_FULL,
+                                val ->
+                                    val.startsWith(
+                                        "http://localhost:" + AwsSqsTestApplication.sqsPort)),
+                            satisfies(AWS_REQUEST_ID, val -> val.isInstanceOf(String.class))),
                 span ->
                     span.hasName("test-queue publish")
                         .hasKind(SpanKind.PRODUCER)
@@ -168,7 +150,7 @@ class AwsSqsTest {
                 span ->
                     span.hasName("test-queue process")
                         .hasKind(SpanKind.CONSUMER)
-                        .hasParent(trace.getSpan(1))
+                        .hasParent(trace.getSpan(2))
                         .hasAttributesSatisfyingExactly(
                             equalTo(RPC_SYSTEM, "aws-api"),
                             equalTo(RPC_METHOD, "ReceiveMessage"),
@@ -187,11 +169,11 @@ class AwsSqsTest {
                             equalTo(MESSAGING_OPERATION, "process"),
                             equalTo(MESSAGING_DESTINATION_NAME, "test-queue")),
                 span ->
-                    span.hasName("callback").hasKind(SpanKind.INTERNAL).hasParent(trace.getSpan(2)),
+                    span.hasName("callback").hasKind(SpanKind.INTERNAL).hasParent(trace.getSpan(3)),
                 span ->
                     span.hasName("Sqs.DeleteMessageBatch")
                         .hasKind(SpanKind.CLIENT)
-                        .hasParent(trace.getSpan(2))
+                        .hasParent(trace.getSpan(3))
                         .hasAttributesSatisfyingExactly(
                             equalTo(RPC_SYSTEM, "aws-api"),
                             equalTo(RPC_METHOD, "DeleteMessageBatch"),
@@ -254,6 +236,24 @@ class AwsSqsTest {
         trace ->
             trace.hasSpansSatisfyingExactly(
                 span -> span.hasName("parent").hasKind(SpanKind.INTERNAL).hasNoParent(),
+                span ->
+                    span.hasName("Sqs.GetQueueUrl")
+                        .hasKind(SpanKind.CLIENT)
+                        .hasParent(trace.getSpan(0))
+                        .hasAttributesSatisfyingExactly(
+                            equalTo(RPC_SYSTEM, "aws-api"),
+                            equalTo(RPC_METHOD, "GetQueueUrl"),
+                            equalTo(RPC_SERVICE, "Sqs"),
+                            equalTo(HTTP_REQUEST_METHOD, POST),
+                            equalTo(HTTP_RESPONSE_STATUS_CODE, 200),
+                            equalTo(SERVER_ADDRESS, "localhost"),
+                            equalTo(SERVER_PORT, AwsSqsTestApplication.sqsPort),
+                            satisfies(
+                                URL_FULL,
+                                val ->
+                                    val.startsWith(
+                                        "http://localhost:" + AwsSqsTestApplication.sqsPort)),
+                            satisfies(AWS_REQUEST_ID, val -> val.isInstanceOf(String.class))),
                 span -> {
                   span.hasName("test-batch-queue publish")
                       .hasKind(SpanKind.PRODUCER)
@@ -280,7 +280,7 @@ class AwsSqsTest {
                                   + AwsSqsTestApplication.sqsPort
                                   + "/000000000000/test-batch-queue"),
                           satisfies(AWS_REQUEST_ID, val -> val.isInstanceOf(String.class)));
-                  producer.set(trace.getSpan(1));
+                  producer.set(trace.getSpan(2));
                 }),
         trace ->
             trace.hasSpansSatisfyingExactly(
